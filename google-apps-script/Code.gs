@@ -3,9 +3,16 @@
  * Google Apps Script Backend
  * 
  * WICHTIG: Nach jeder Änderung:
- * 1. Speichern (Ctrl+S)
- * 2. Bereitstellen → Neue Bereitstellung → Web-App
- * 3. Zugriff: "Jeder" (nicht "Jeder mit Google-Konto")
+ * 1. Speichern (Ctrl+S). Menü- und Trigger-Funktionen (z. B. das tägliche
+ *    Archivieren und die Datenschutz-Bereinigung) laufen immer auf dem
+ *    gespeicherten Stand – dafür ist KEINE Bereitstellung nötig.
+ * 2. Nur wenn doGet oder doPost geändert wurden, zusätzlich bereitstellen:
+ *    Bereitstellen → Bereitstellungen verwalten → (Stift) Bearbeiten
+ *    → Version: "Neue Version" → Bereitstellen.
+ *    NIEMALS "Neue Bereitstellung" wählen: das erzeugt eine NEUE URL. Die
+ *    in index.html hinterlegte API_URL zeigt dann weiter auf den alten
+ *    Stand, und die App arbeitet still mit veralteter Logik weiter.
+ * 3. Zugriff bleibt: "Jeder" (nicht "Jeder mit Google-Konto")
  */
 
 // === Configuration ===
@@ -1541,6 +1548,8 @@ function onOpen() {
     .addItem('Daten prüfen', 'integritaetspruefung')
     .addSeparator()
     .addItem('Alte Anlässe bereinigen', 'alteAnlaesseBereinigen')
+    .addItem('Datenschutz: Vorschau Bereinigung', 'datenschutzVorschau')
+    .addItem('Datenschutz: Kontaktdaten bereinigen', 'datenschutzBereinigungMenu')
     .addItem('Admin-Status prüfen', 'adminKeyStatus')
     .addItem('Script-Properties aufräumen', 'bereinigeScriptProperties')
     .addItem('Audit-Log anzeigen', 'zeigeAuditLog')
@@ -2823,6 +2832,11 @@ function autoArchive() {
     logAudit('AUTO_ARCHIVE', { jahr: y, success: !!result.success },
              !!result.success, result.message);
   });
+
+  // Im selben täglichen Lauf: Kontaktdaten abgelaufener Anlässe altern
+  // lassen. Bewusst hier angehängt statt als eigener Trigger – so bleibt
+  // die bestehende Trigger-Installation unverändert gültig.
+  piiBereinigungAutomatisch();
 }
 
 /**
@@ -2994,4 +3008,370 @@ function buildIntegrityReport() {
   return { success: true, findings: report };
 }
 
+// =============================================================
+// === Datenschutz: Alterung der Kontaktdaten ==================
+// =============================================================
+//
+// Die Datenschutzerklärung verspricht, dass die Daten der Helfer:innen
+// wenige Monate nach dem Anlass gelöscht werden. Bis hierhin gab es
+// dafür KEINEN automatischen Weg: 'alteAnlaesseBereinigen' musste von
+// Hand aus dem Menü gestartet werden, und 'autoArchive' verschiebt die
+// Anmeldungen nur in Archiv-Tabs, wo sie unbegrenzt liegen bleiben.
+//
+// Dieser Block schliesst die Lücke. Er löscht Name, E-Mail, Telefon und
+// Notizen aus jeder Anmeldung, deren Anlass länger als
+// PII_AUFBEWAHRUNG_MONATE zurückliegt – in 'Anmeldungen' UND in allen
+// 'Archiv Anmeldungen *'-Tabs.
+//
+// Die Zeile selbst bleibt stehen. Das ist Absicht:
+//   * Anlässe!F (Angemeldete) ist eine COUNTIFS-Formel über
+//     Anmeldungen!B:B. Würden wir Zeilen löschen, fiele der Zähler auf
+//     0 und die Teilnehmerzahl früherer Anlässe wäre verloren.
+//   * Was übrig bleibt (Zeitstempel, Anlass-ID, Anlass-Name, Status)
+//     hat keinen Personenbezug mehr.
+//
+// SICHERHEIT: PII_BEREINIGUNG_AKTIV ist bewusst auf false gesetzt. Der
+// tägliche Trigger protokolliert dann nur, was er löschen WÜRDE, und
+// ändert nichts. Erst 'Datenschutz: Vorschau' im Menü ansehen, prüfen,
+// und danach hier auf true stellen.
 
+var PII_AUFBEWAHRUNG_MONATE = 3;
+var PII_BEREINIGUNG_AKTIV = true;
+
+// Spalten in ANMELDUNG_HEADERS, die geleert werden (1-basiert):
+//   3 Name, 4 E-Mail, 5 Telefon, 8 Notizen
+// Erhalten bleiben: 1 Zeitstempel, 2 Anlass-ID, 6 Anlass, 7 Status.
+var PII_SPALTEN = [3, 4, 5, 8];
+
+// Rueckfallfrist fuer Anmeldungen, deren Anlass nicht mehr auffindbar ist
+// (Anlass geloescht). Fuer diese ist das Anlassdatum unbekannt; als Ersatz
+// dient der Zeitstempel der Anmeldung. Der liegt aber VOR dem Anlass –
+// oft Monate. Mit der kurzen Frist gemessen ab Anmeldung wuerden die
+// Kontaktdaten unter Umstaenden schon vor dem Anlass geloescht, und die
+// Organisator:innen koennten die Helfer:innen nicht mehr erreichen.
+// Deshalb hier eine Frist, die laenger ist als jede plausible Vorlaufzeit
+// (Anlaesse werden hoechstens ein Schuljahr im Voraus erfasst).
+var PII_WAISEN_MONATE = 12;
+
+/**
+ * Stichtag: Anlässe, die davor stattfanden, sind fällig.
+ */
+function piiStichtag_(monate) {
+  var cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - (monate || PII_AUFBEWAHRUNG_MONATE));
+  cutoff.setHours(0, 0, 0, 0);
+  return cutoff;
+}
+
+/**
+ * Map Anlass-ID -> Datum, gespeist aus 'Anlässe' und allen
+ * 'Archiv Anlässe *'-Tabs. Anmeldungen führen kein Datum mit, nur die
+ * Anlass-ID, deshalb brauchen wir diese Zuordnung.
+ */
+function buildAnlassDatumMap_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var map = {};
+  ss.getSheets().forEach(function(sheet) {
+    var name = sheet.getName();
+    if (name !== 'Anlässe' && name.indexOf('Archiv Anlässe') !== 0) return;
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) return;
+    var values = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
+    values.forEach(function(row) {
+      var id = String(row[0] || '').trim();
+      if (!id) return;
+      var d = parseDate(row[2]);
+      if (d) map[id] = d;
+    });
+  });
+  return map;
+}
+
+/**
+ * Reine Analyse – schreibt nichts. Liefert für jedes betroffene Blatt
+ * die Zeilennummern, deren Kontaktdaten fällig sind, plus Statistik.
+ *
+ * Waisen (Anmeldung ohne passenden Anlass, z.B. weil der Anlass über
+ * 'Alte Anlässe bereinigen' gelöscht wurde) fallen auf den Zeitstempel
+ * der Anmeldung zurück und werden separat ausgewiesen.
+ */
+function sammlePiiBereinigung_(cutoff) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var datumMap = buildAnlassDatumMap_();
+  var waisenCutoff = piiStichtag_(PII_WAISEN_MONATE);
+  var plan = { cutoff: cutoff, waisenCutoff: waisenCutoff, sheets: [],
+               total: 0, waisen: 0, anlaesse: {}, audit: 0 };
+
+  // Audit-Log nur ZÄHLEN (die eigentliche Bereinigung macht
+  // bereinigeAuditLog_ unter dem Lock).
+  var auditSheet = ss.getSheetByName('Audit-Log');
+  if (auditSheet && auditSheet.getLastRow() >= 2) {
+    var auditVals = auditSheet.getRange(2, 1, auditSheet.getLastRow() - 1, 3).getValues();
+    for (var a = 0; a < auditVals.length; a++) {
+      var ats = parseDate(auditVals[a][0]);
+      if (String(auditVals[a][2] || '') !== '' && ats && ats < cutoff) plan.audit++;
+    }
+  }
+
+  ss.getSheets().forEach(function(sheet) {
+    var name = sheet.getName();
+    if (name !== 'Anmeldungen' && name.indexOf('Archiv Anmeldungen') !== 0) return;
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) return;
+
+    var values = sheet.getRange(2, 1, lastRow - 1, ANMELDUNG_HEADERS.length).getValues();
+    var treffer = [];
+
+    for (var i = 0; i < values.length; i++) {
+      var row = values[i];
+      var anlassId = String(row[1] || '').trim();
+
+      // Bereits bereinigt? Dann überspringen (idempotent).
+      var hatDaten = false;
+      for (var s = 0; s < PII_SPALTEN.length; s++) {
+        if (String(row[PII_SPALTEN[s] - 1] || '').trim() !== '') { hatDaten = true; break; }
+      }
+      if (!hatDaten) continue;
+
+      var datum = anlassId ? datumMap[anlassId] : null;
+      var istWaise = false;
+      var vergleich = cutoff;
+      if (!datum) {
+        datum = parseDate(row[0]); // Zeitstempel der Anmeldung
+        istWaise = true;
+        vergleich = waisenCutoff; // laengere Frist, siehe PII_WAISEN_MONATE
+      }
+      if (!datum || datum >= vergleich) continue;
+
+      treffer.push(i + 2); // 1-basierte Zeile, Kopfzeile ist Zeile 1
+      plan.total++;
+      if (istWaise) plan.waisen++;
+      var key = (anlassId || 'ohne ID') + ' · ' + String(row[5] || '').trim();
+      plan.anlaesse[key] = (plan.anlaesse[key] || 0) + 1;
+    }
+
+    if (treffer.length) {
+      plan.sheets.push({ name: name, rows: treffer, values: values });
+    }
+  });
+
+  return plan;
+}
+
+/**
+ * Wendet einen Plan an. Schreibt pro Blatt zwei Bereiche (Spalten 3–5
+ * und Spalte 8) statt Zelle für Zelle. Läuft unter dem Script-Lock,
+ * damit keine gleichzeitige Anmeldung dazwischenschreibt.
+ */
+function fuehrePiiBereinigungAus_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var geleert = 0;
+
+  var lock = LockService.getScriptLock();
+  try {
+    if (!lock.tryLock(20000)) {
+      return { success: false, error: 'Server gerade ausgelastet. Bitte später erneut.' };
+    }
+
+    // Bewusst ERST hier erhoben, unter dem Lock: zwischen einer früheren
+    // Erhebung und dem Zurückschreiben könnte eine Anmeldung eintreffen
+    // oder ein Admin eine Zeile ändern – ein Schreiben aus veralteten
+    // Werten würde das stillschweigend überschreiben.
+    var plan = sammlePiiBereinigung_(piiStichtag_());
+
+    plan.sheets.forEach(function(eintrag) {
+      var sheet = ss.getSheetByName(eintrag.name);
+      if (!sheet) return;
+      var values = eintrag.values;
+      var treffer = {};
+      eintrag.rows.forEach(function(r) { treffer[r] = true; });
+
+      var block345 = [];
+      var block8 = [];
+      for (var i = 0; i < values.length; i++) {
+        var zeile = i + 2;
+        if (treffer[zeile]) {
+          block345.push(['', '', '']);
+          block8.push(['']);
+          geleert++;
+        } else {
+          block345.push([values[i][2], values[i][3], values[i][4]]);
+          block8.push([values[i][7]]);
+        }
+      }
+      sheet.getRange(2, 3, block345.length, 3).setValues(block345);
+      // Spalte 8 (Notizen) existiert auf nicht migrierten Blättern
+      // womöglich nicht – dann gibt es dort auch nichts zu leeren.
+      if (sheet.getMaxColumns() >= 8) {
+        sheet.getRange(2, 8, block8.length, 1).setValues(block8);
+      }
+    });
+
+    var auditGeleert = bereinigeAuditLog_(plan.cutoff);
+
+    return { success: true, geleert: geleert, audit: auditGeleert };
+  } catch (e) {
+    return { success: false, error: String(e) };
+  } finally {
+    try { if (lock.hasLock()) lock.releaseLock(); } catch (_) {}
+  }
+}
+
+/**
+ * Das Audit-Log speichert bei jeder Anmeldung die E-Mail-Adresse mit
+ * (logAudit('REGISTRATION', { anlassId, email })). Ohne diesen Schritt
+ * bliebe sie dort liegen, während sie aus 'Anmeldungen' längst entfernt
+ * ist – die Aufbewahrungszusage wäre dann nur halb eingelöst.
+ *
+ * Geleert wird ausschliesslich die Spalte 'Daten' (Spalte 3). Aktion,
+ * Zeitstempel, Erfolg und Fehler bleiben stehen: sie tragen keinen
+ * Personenbezug und werden für die Nachvollziehbarkeit gebraucht.
+ *
+ * Aufruf erfolgt aus fuehrePiiBereinigungAus_() unter demselben Lock.
+ */
+function bereinigeAuditLog_(cutoff) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName('Audit-Log');
+  if (!sheet) return 0;
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+
+  var range = sheet.getRange(2, 1, lastRow - 1, 3);
+  var values = range.getValues();
+  var geleert = 0;
+  var spalte3 = [];
+
+  for (var i = 0; i < values.length; i++) {
+    var ts = parseDate(values[i][0]);
+    var daten = String(values[i][2] || '');
+    if (daten !== '' && ts && ts < cutoff) {
+      spalte3.push(['']);
+      geleert++;
+    } else {
+      spalte3.push([values[i][2]]);
+    }
+  }
+
+  if (geleert) sheet.getRange(2, 3, spalte3.length, 1).setValues(spalte3);
+  return geleert;
+}
+
+/**
+ * Menü: Vorschau. Ändert nichts. Zeigt ausschliesslich Zahlen – keine
+ * Namen, keine E-Mail-Adressen. Wer die Rohdaten sehen will, öffnet die
+ * Tabelle; eine Vorschau muss die Daten nicht noch einmal ausbreiten.
+ */
+function datenschutzVorschau() {
+  var ui = SpreadsheetApp.getUi();
+  var cutoff = piiStichtag_();
+  var plan = sammlePiiBereinigung_(cutoff);
+
+  var zeilen = [
+    'Stichtag: Anlässe vor dem ' + formatDatum(cutoff),
+    '(= ' + PII_AUFBEWAHRUNG_MONATE + ' Monate zurück)',
+    '',
+    'Betroffene Anmeldungen: ' + plan.total
+  ];
+
+  zeilen.push('Betroffene Audit-Log-Zeilen: ' + plan.audit);
+
+  if (plan.total === 0 && plan.audit === 0) {
+    zeilen.push('');
+    zeilen.push('Nichts zu tun – es liegen keine fälligen Kontaktdaten vor.');
+  } else {
+    zeilen.push('');
+    zeilen.push('Nach Anlass:');
+    Object.keys(plan.anlaesse).sort().forEach(function(k) {
+      zeilen.push('  ' + k + ': ' + plan.anlaesse[k]);
+    });
+    zeilen.push('');
+    zeilen.push('Nach Blatt:');
+    plan.sheets.forEach(function(s) {
+      zeilen.push('  ' + s.name + ': ' + s.rows.length);
+    });
+    if (plan.waisen) {
+      zeilen.push('');
+      zeilen.push('Davon ' + plan.waisen + ' ohne auffindbaren Anlass');
+      zeilen.push('(Anlass gelöscht). Für diese zählt der Zeitstempel');
+      zeilen.push('der Anmeldung, und zwar erst nach ' + PII_WAISEN_MONATE + ' Monaten:');
+      zeilen.push('vor dem ' + formatDatum(plan.waisenCutoff) + '.');
+      zeilen.push('So werden sie nie vor dem Anlass gelöscht.');
+    }
+    zeilen.push('');
+    zeilen.push('Geleert würden: Name, E-Mail, Telefon, Notizen.');
+    zeilen.push('Erhalten bleiben: Zeitstempel, Anlass-ID, Anlass, Status');
+    zeilen.push('– und damit die Teilnehmerzahl pro Anlass.');
+  }
+
+  zeilen.push('');
+  zeilen.push('Automatik ist derzeit: ' + (PII_BEREINIGUNG_AKTIV ? 'AKTIV' : 'AUS'));
+
+  logAudit('DATENSCHUTZ_VORSCHAU', { faellig: plan.total, waisen: plan.waisen }, true, null);
+  ui.alert('🔒 Datenschutz – Vorschau', zeilen.join('\n'), ui.ButtonSet.OK);
+}
+
+/**
+ * Menü: tatsächliche Bereinigung, mit Rückfrage. Funktioniert auch,
+ * solange PII_BEREINIGUNG_AKTIV noch false ist – die Flagge steuert nur
+ * den unbeaufsichtigten Trigger, nicht die bewusste Handauslösung.
+ */
+function datenschutzBereinigungMenu() {
+  var ui = SpreadsheetApp.getUi();
+  var cutoff = piiStichtag_();
+  var plan = sammlePiiBereinigung_(cutoff);
+
+  if (plan.total === 0 && plan.audit === 0) {
+    ui.alert('🔒 Datenschutz', 'Nichts zu tun – es liegen keine fälligen Kontaktdaten vor.', ui.ButtonSet.OK);
+    return;
+  }
+
+  var antwort = ui.alert(
+    '🔒 Kontaktdaten endgültig löschen?',
+    'Bei ' + plan.total + ' Anmeldung(en) werden Name, E-Mail, Telefon und\n' +
+    'Notizen geleert (Anlässe vor dem ' + formatDatum(cutoff) + ').\n' +
+    'Zusätzlich wird bei ' + plan.audit + ' Audit-Log-Zeile(n) die Spalte\n' +
+    '"Daten" geleert (enthält E-Mail-Adressen).\n\n' +
+    'Die Zeilen bleiben stehen, die Teilnehmerzahlen also erhalten.\n\n' +
+    'Das lässt sich nicht rückgängig machen. Fortfahren?',
+    ui.ButtonSet.YES_NO
+  );
+  if (antwort !== ui.Button.YES) return;
+
+  var result = fuehrePiiBereinigungAus_();
+  if (!result.success) {
+    logAudit('DATENSCHUTZ_BEREINIGUNG', {}, false, result.error);
+    ui.alert('Fehler: ' + result.error);
+    return;
+  }
+  logAudit('DATENSCHUTZ_BEREINIGUNG', { geleert: result.geleert, quelle: 'menu' }, true, null);
+  ui.alert('✅ Datenschutz',
+           result.geleert + ' Anmeldung(en) und ' + (result.audit || 0) +
+           ' Audit-Log-Zeile(n) bereinigt.', ui.ButtonSet.OK);
+}
+
+/**
+ * Unbeaufsichtigter Lauf, aufgerufen vom täglichen Trigger. Solange
+ * PII_BEREINIGUNG_AKTIV false ist, wird nur protokolliert. So lässt sich
+ * über Tage im Audit-Log mitlesen, was die Automatik täte, bevor man sie
+ * scharf schaltet.
+ */
+function piiBereinigungAutomatisch() {
+  try {
+    var plan = sammlePiiBereinigung_(piiStichtag_());
+    if (plan.total === 0 && plan.audit === 0) return;
+
+    if (!PII_BEREINIGUNG_AKTIV) {
+      logAudit('DATENSCHUTZ_PROBELAUF',
+               { faellig: plan.total, waisen: plan.waisen, audit: plan.audit }, true,
+               'Automatik aus – nichts geändert');
+      return;
+    }
+
+    var result = fuehrePiiBereinigungAus_();
+    logAudit('DATENSCHUTZ_BEREINIGUNG',
+             { geleert: result.geleert || 0, quelle: 'trigger' },
+             !!result.success, result.error || null);
+  } catch (e) {
+    logAudit('DATENSCHUTZ_BEREINIGUNG', {}, false, String(e));
+  }
+}
